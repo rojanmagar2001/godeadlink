@@ -3,10 +3,10 @@ package model
 import "time"
 
 type Result struct {
-	URL     string
-	Status  int
-	Err     error
-	Elapsed time.Duration
+	URL        string
+	StatusCode int
+	Err        error
+	Elapsed    time.Duration
 }
 
 func (r Result) IsDead() bool {
@@ -14,5 +14,5 @@ func (r Result) IsDead() bool {
 		return true
 	}
 
-	return r.Status >= 400
+	return r.StatusCode >= 400
 }

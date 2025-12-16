@@ -72,3 +72,36 @@ func TestExtractLinks_DeduplicatesFragments(t *testing.T) {
 		t.Fatalf("unexpected link: %s", links[0])
 	}
 }
+
+func TestExtractLinks_ResolvesAndDedupes(t *testing.T) {
+	html := `
+	<html><body>
+		<a href="/ok">OK</a>
+		<a href="/ok#frag">OK2</a>
+		<a href="https://example.com/abs">ABS</a>
+		<a href="mailto:test@example.com">MAIL</a>
+		<a href="">EMPTY</a>
+	</body></html>`
+
+	links, err := ExtractLinks("http://localhost:1234/base", strings.NewReader(html))
+	if err != nil {
+		t.Fatalf("ExtractLinks error: %v", err)
+	}
+
+	// Expect:
+	// - http://localhost:1234/ok   (fragment dropped, deduped)
+	// - https://example.com/abs
+	want := map[string]bool{
+		"http://localhost:1234/ok": true,
+		"https://example.com/abs":  true,
+	}
+
+	if len(links) != len(want) {
+		t.Fatalf("got %d links, want %d: %#v", len(links), len(want), links)
+	}
+	for _, got := range links {
+		if !want[got] {
+			t.Fatalf("unexpected link: %s", got)
+		}
+	}
+}

@@ -105,3 +105,8 @@ check: fmt vet test
 
 clean:
 	rm -rf $(BIN_DIR)
+
+.PHONY: bench
+
+bench:
+	$(GO) test ./... -bench=. -benchmem
