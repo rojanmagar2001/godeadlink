@@ -19,6 +19,7 @@ func main() {
 		maxDepth      = flag.Int("max-depth", 2, "Max crawl depth (0 = only start page)")
 		maxPages      = flag.Int("max-pages", 200, "Max number of pages to crawl")
 		allowExternal = flag.Bool("allow-external", false, "Also check external links (default: false)")
+		checkAssets   = flag.Bool("check-assets", true, "Check asset links (img, script, link)")
 	)
 	flag.Parse()
 
@@ -30,6 +31,7 @@ func main() {
 		MaxDepth:      *maxDepth,
 		MaxPages:      *maxPages,
 		AllowExternal: *allowExternal,
+		CheckAssets:   *checkAssets,
 	}
 
 	if err := app.Run(context.Background(), cfg, os.Stdout, os.Stderr); err != nil {

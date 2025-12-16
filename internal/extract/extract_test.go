@@ -79,3 +79,23 @@ func TestExtractLinks_SkipsFragmentAndUnsupportedSchemes(t *testing.T) {
 		t.Fatalf("expected 3 unsupported scheme skips, got %d", unsup)
 	}
 }
+
+func TestExtractLinks_InvalidURL(t *testing.T) {
+	html := `<html><body><a href="http://[::1">bad</a></body></html>`
+
+	found, err := ExtractLinks("https://example.com", strings.NewReader(html))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var invalid int
+	for _, f := range found {
+		if f.SkipReason == model.SkipInvalidURL {
+			invalid++
+		}
+	}
+
+	if invalid != 1 {
+		t.Fatalf("expected 1 invalid url, got %d", invalid)
+	}
+}

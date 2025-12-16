@@ -27,6 +27,7 @@ type Config struct {
 	MaxPages      int
 	AllowExternal bool
 
+	CheckAssets   bool
 	ProgressEvery time.Duration // e.g. 1s
 }
 
@@ -76,6 +77,9 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 	if cfg.ProgressEvery <= 0 {
 		cfg.ProgressEvery = 1 * time.Second
 	}
+	if !cfg.CheckAssets {
+		cfg.CheckAssets = true
+	}
 
 	crawlProgress := newProgressLogger(cfg.ProgressEvery)
 
@@ -104,6 +108,8 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 	queue := []pageJob{{URL: cfg.StartURL, Depth: 0}}
 
 	crawledPages := 0
+
+	skippedCounts := make(map[model.SkipReason]int)
 
 	for len(queue) > 0 && crawledPages < cfg.MaxPages {
 		job := queue[0]
@@ -168,10 +174,17 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		for _, fl := range found {
 			// If skipped, record as discovered (optional) but don’t crawl/check.
 			if fl.SkipReason != "" || fl.URL == "" {
+				skippedCounts[fl.SkipReason]++
 				// You can choose to record skipped links too, but it may be noisy.
 				// For learning, we record them as discovered with a marker in sources later (Stage 8).
 				continue
 			}
+
+			// If assets are disabled, skip asset links entirely
+			if fl.Kind == model.LinkKindAsset && !cfg.CheckAssets {
+				continue
+			}
+
 			link := fl.URL
 
 			// Track source relationship: link was found on job.URL
@@ -229,6 +242,7 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 
 		// If we’re not allowing external checks, skip them (but keep them discovered).
 		if isExternal && !cfg.AllowExternal {
+			skippedCounts[model.SkipExternal]++
 			skippedExternal++
 			continue
 		}
@@ -350,6 +364,19 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		s.SkippedExt, cfg.AllowExternal,
 		s.OK, s.Redirects, s.DeadHTTP, s.Errors,
 	)
+
+	if len(skippedCounts) > 0 {
+		fmt.Fprintln(stdout, "\nSkipped links:")
+		keys := make([]string, 0, len(skippedCounts))
+		for k := range skippedCounts {
+			keys = append(keys, string(k))
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			fmt.Fprintf(stdout, "  %-20s %d\n", k+":", skippedCounts[model.SkipReason(k)])
+		}
+	}
 
 	_ = stderr // reserved for later structured logging/warnings
 	return nil

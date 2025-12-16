@@ -98,7 +98,7 @@ func ExtractLinks(baseURL string, r io.Reader) ([]FoundLink, error) {
 					// Keep as “invalid” by returning a pseudo skipped item via unsupported scheme? No:
 					// We’ll treat invalid URLs as checkable later by emitting an empty SkipReason but raw string.
 					// For stage 4 we keep it simple: mark unsupported_scheme to indicate “not checkable”.
-					emit(raw, nil, kind, model.SkipUnsupportedScheme)
+					emit(raw, nil, kind, model.SkipInvalidURL)
 					return
 				}
 
