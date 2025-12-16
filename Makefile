@@ -14,6 +14,7 @@ LDFLAGS       := -s -w
 URL           ?= https://example.com
 TIMEOUT       ?= 10s
 HEAD_FIRST    ?= true
+CONCURRENCY ?= 20
 
 # =========================
 # Phony targets
@@ -65,7 +66,8 @@ run:
 	$(GO) run $(CMD_DIR) \
 		--url $(URL) \
 		--timeout $(TIMEOUT) \
-		--head-first=$(HEAD_FIRST)
+		--head-first=$(HEAD_FIRST) \
+		--concurrency=$(CONCURRENCY)
 
 dev: fmt test run
 

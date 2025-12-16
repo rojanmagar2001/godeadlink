@@ -12,16 +12,18 @@ import (
 
 func main() {
 	var (
-		startURL  = flag.String("url", "", "Start URL (single page) e.g. https://example.com")
-		timeout   = flag.Duration("timeout", 10*time.Second, "HTTP timeout (e.g. 10s)")
-		headFirst = flag.Bool("head-first", true, "Try HEAD before GET (fallback to GET if needed)")
+		startURL    = flag.String("url", "", "Start URL (single page) e.g. https://example.com")
+		timeout     = flag.Duration("timeout", 10*time.Second, "HTTP timeout (e.g. 10s)")
+		headFirst   = flag.Bool("head-first", true, "Try HEAD before GET (fallback to GET if needed)")
+		concurrency = flag.Int("concurrency", 20, "Number of concurrent links checks")
 	)
 	flag.Parse()
 
 	cfg := app.Config{
-		StartURL:  *startURL,
-		Timeout:   *timeout,
-		HeadFirst: *headFirst,
+		StartURL:    *startURL,
+		Timeout:     *timeout,
+		HeadFirst:   *headFirst,
+		Concurrency: *concurrency,
 	}
 
 	if err := app.Run(context.Background(), cfg, os.Stdout, os.Stderr); err != nil {
