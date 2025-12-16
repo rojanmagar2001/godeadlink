@@ -15,6 +15,9 @@ URL           ?= https://example.com
 TIMEOUT       ?= 10s
 HEAD_FIRST    ?= true
 CONCURRENCY ?= 20
+MAX_DEPTH ?= 2
+MAX_PAGES ?= 200
+ALLOW_EXTERNAL ?= false
 
 # =========================
 # Phony targets
@@ -67,7 +70,10 @@ run:
 		--url $(URL) \
 		--timeout $(TIMEOUT) \
 		--head-first=$(HEAD_FIRST) \
-		--concurrency=$(CONCURRENCY)
+		--concurrency=$(CONCURRENCY) \
+		--max-depth=$(MAX_DEPTH) \
+		--max-pages=$(MAX_PAGES) \
+		--allow-external=$(ALLOW_EXTERNAL)	
 
 dev: fmt test run
 

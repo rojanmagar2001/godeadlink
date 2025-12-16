@@ -26,25 +26,22 @@ func TestRun_ConcurrencyStableAndComplete(t *testing.T) {
 		`))
 	})
 
-	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/a-dead", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	})
-	mux.HandleFunc("/z-dead", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	})
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/a-dead", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	mux.HandleFunc("/z-dead", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
 
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	cfg := Config{
-		StartURL:    srv.URL + "/",
-		Timeout:     2 * time.Second,
-		HeadFirst:   false, // keep deterministic for test
-		Concurrency: 8,
-		UserAgent:   "deadlink-test/0.1",
+		StartURL:      srv.URL + "/",
+		Timeout:       2 * time.Second,
+		HeadFirst:     false, // keep deterministic for test
+		Concurrency:   8,
+		MaxDepth:      0, // only crawl the start page
+		MaxPages:      10,
+		AllowExternal: false,
+		UserAgent:     "deadlink-test/0.1",
 	}
 
 	var out bytes.Buffer
@@ -56,9 +53,15 @@ func TestRun_ConcurrencyStableAndComplete(t *testing.T) {
 
 	got := out.String()
 
-	// Must say checked 3 links.
-	if !strings.Contains(got, "Checked 3 links") {
-		t.Fatalf("expected summary for 3 links, got:\n%s", got)
+	// Stage 3 prints this style of summary.
+	if !strings.Contains(got, "Crawled pages: 1") {
+		t.Fatalf("expected to crawl 1 page, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Discovered links: 4") {
+		t.Fatalf("expected 4 discovered links (includes the page itself), got:\n%s", got)
+	}
+	if !strings.Contains(got, "Checked links: 4") {
+		t.Fatalf("expected 4 checked links, got:\n%s", got)
 	}
 
 	// Dead links should appear sorted by URL (a-dead before z-dead).
@@ -69,5 +72,10 @@ func TestRun_ConcurrencyStableAndComplete(t *testing.T) {
 	}
 	if aIdx > zIdx {
 		t.Fatalf("expected sorted output (a-dead before z-dead), got:\n%s", got)
+	}
+
+	// Also confirm we print source tracking.
+	if !strings.Contains(got, "found on: "+srv.URL+"/") {
+		t.Fatalf("expected source line, got:\n%s", got)
 	}
 }

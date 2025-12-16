@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,18 +22,38 @@ type Config struct {
 	HeadFirst   bool
 	Concurrency int
 	UserAgent   string
+
+	MaxDepth      int
+	MaxPages      int
+	AllowExternal bool
+
+	ProgressEvery time.Duration // e.g. 1s
+}
+
+// linkMeta tracks where a link was found + at what crawl depth it first appeared.
+type linkMeta struct {
+	URL            string
+	FirstSeenDepth int
+	Sources        map[string]struct{} // set of source page URLs
+}
+
+type pageJob struct {
+	URL   string
+	Depth int
 }
 
 type summary struct {
-	Checked   int
+	CrawledPages int
+	Discovered   int
+	Checked      int
+	SkippedExt   int
+
 	OK        int
 	DeadHTTP  int
 	Redirects int
 	Errors    int
 }
 
-// Run executes the Stage-1 pipeline:
-// fetch start page -> extract <a href> -> check links -> print dead links.
 func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 	if cfg.StartURL == "" {
 		return fmt.Errorf("start url is required")
@@ -45,188 +67,342 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 20
 	}
-
-	// Start page fetch gets its own timeout budget.
-	pageCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(pageCtx, http.MethodGet, cfg.StartURL, nil)
-	if err != nil {
-		return fmt.Errorf("build start request: %w", err)
+	if cfg.MaxDepth < 0 {
+		cfg.MaxDepth = 0
 	}
-	req.Header.Set("User-Agent", cfg.UserAgent)
+	if cfg.MaxPages <= 0 {
+		cfg.MaxPages = 200
+	}
+	if cfg.ProgressEvery <= 0 {
+		cfg.ProgressEvery = 1 * time.Second
+	}
 
+	crawlProgress := newProgressLogger(cfg.ProgressEvery)
+
+	start, err := url.Parse(cfg.StartURL)
+	if err != nil {
+		return fmt.Errorf("parse start url: %w", err)
+	}
+	startHost := strings.ToLower(start.Hostname())
+
+	// ------------------------------------------------------------
+	// Stage 3: Crawl pages (same-host only) up to MaxDepth/MaxPages
+	// ------------------------------------------------------------
+	//
+	// We perform crawling sequentially for now (simpler and easier to learn).
+	// Concurrency is used for *link checking* (Stage 2 worker pool).
+	//
+	// We maintain:
+	// - visited pages set (avoid loops)
+	// - queue of page jobs (BFS-ish)
+	// - link index: link URL -> metadata (sources, firstSeenDepth)
+	//
 	client := &http.Client{Timeout: cfg.Timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("fetch start page: %w", err)
-	}
-	defer resp.Body.Close()
+	visitedPages := make(map[string]struct{})
+	linkIndex := make(map[string]*linkMeta)
 
-	links, err := extract.ExtractLinks(cfg.StartURL, resp.Body)
-	if err != nil {
-		return fmt.Errorf("extract links: %w", err)
+	queue := []pageJob{{URL: cfg.StartURL, Depth: 0}}
+
+	crawledPages := 0
+
+	for len(queue) > 0 && crawledPages < cfg.MaxPages {
+		job := queue[0]
+		queue = queue[1:]
+
+		// Depth limit: do not fetch pages deeper than MaxDepth.
+		if job.Depth > cfg.MaxDepth {
+			continue
+		}
+
+		// Deduplicate pages.
+		pageURL := normalizeForKey(job.URL)
+		if _, seen := visitedPages[pageURL]; seen {
+			continue
+		}
+		visitedPages[pageURL] = struct{}{}
+		crawledPages++
+
+		// Fetch page with its own timeout context.
+		pageCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+		req, err := http.NewRequestWithContext(pageCtx, http.MethodGet, job.URL, nil)
+		if err != nil {
+			cancel()
+			// If the page URL itself is malformed, record it as a “link” error with source unknown.
+			recordLink(linkIndex, job.URL, job.URL, job.Depth)
+			continue
+		}
+		req.Header.Set("User-Agent", cfg.UserAgent)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			cancel()
+			// If fetching this page fails, we still record the page as a link found on itself,
+			// so it will show up in results.
+			recordLink(linkIndex, job.URL, job.URL, job.Depth)
+			continue
+		}
+
+		// Only parse HTML pages. If not HTML, treat as leaf.
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if !strings.Contains(ct, "text/html") && !strings.Contains(ct, "application/xhtml") {
+			_ = resp.Body.Close()
+			cancel()
+			// Record page itself as a checkable link.
+			recordLink(linkIndex, job.URL, job.URL, job.Depth)
+			continue
+		}
+
+		// Extract <a href> links from this page.
+		links, err := extract.ExtractLinks(job.URL, resp.Body)
+		_ = resp.Body.Close()
+		cancel()
+		if err != nil {
+			// If parsing fails, still record the page itself.
+			recordLink(linkIndex, job.URL, job.URL, job.Depth)
+			continue
+		}
+
+		// Record the page itself as a link (useful to catch broken pages too).
+		recordLink(linkIndex, job.URL, job.URL, job.Depth)
+
+		for _, link := range links {
+			// Track source relationship: link was found on job.URL
+			recordLink(linkIndex, link, job.URL, job.Depth)
+
+			// Decide whether to enqueue this link as another page to crawl.
+			u, err := url.Parse(link)
+			if err != nil {
+				continue
+			}
+			host := strings.ToLower(u.Hostname())
+
+			// Crawl scope: same-host only.
+			if host != "" && host != startHost {
+				continue
+			}
+
+			// Only enqueue if we still have depth budget.
+			if job.Depth < cfg.MaxDepth {
+				queue = append(queue, pageJob{URL: link, Depth: job.Depth + 1})
+			}
+		}
+
+		if crawlProgress.ShouldLog() {
+			fmt.Fprintf(stdout,
+				"[crawl] pages=%d queue=%d discoveredLinks=%d\n",
+				crawledPages,
+				len(queue),
+				len(linkIndex),
+			)
+		}
 	}
 
-	// ---------------------------------------------------------------------
-	// Worker pool setup
-	//
-	// We want to check many links concurrently without spawning an
-	// unbounded number of goroutines.
-	//
-	// Pattern used:
-	//   - jobs channel: carries links to be checked
-	//   - results channel: carries completed check results
-	//   - fixed number of worker goroutines
-	//   - WaitGroup to know when all workers are done
-	// ---------------------------------------------------------------------
+	// ------------------------------------------------------------
+	// Build the set of links we will actually check
+	// ------------------------------------------------------------
+	linksToCheck := make([]*linkMeta, 0, len(linkIndex))
+	skippedExternal := 0
+
+	for _, meta := range linkIndex {
+		u, err := url.Parse(meta.URL)
+		if err != nil {
+			// Still check malformed URLs via the checker; it will return error.
+			linksToCheck = append(linksToCheck, meta)
+			continue
+		}
+
+		host := strings.ToLower(u.Hostname())
+		isExternal := host != "" && host != startHost
+
+		// If we’re not allowing external checks, skip them (but keep them discovered).
+		if isExternal && !cfg.AllowExternal {
+			skippedExternal++
+			continue
+		}
+		linksToCheck = append(linksToCheck, meta)
+	}
+
+	// Stable ordering of checks (helps consistent testability and output).
+	sort.Slice(linksToCheck, func(i, j int) bool {
+		return linksToCheck[i].URL < linksToCheck[j].URL
+	})
+
+	// ------------------------------------------------------------
+	// Stage 2 worker pool: Concurrently check links
+	// ------------------------------------------------------------
 	chk := check.NewChecker(cfg.Timeout, cfg.HeadFirst)
 
-	// jobs is an unbuffered channel of work items.
-	// Each item is a single link (string) to check.
-	jobs := make(chan string)
-
-	// results carries completed link-check results.
-	// We buffer it to the concurrency size so workers are not blocked
-	// on send if the collector is momentarily slow.
+	jobs := make(chan *linkMeta)
 	results := make(chan model.Result, cfg.Concurrency)
 
 	var wg sync.WaitGroup
 
-	// worker is the function run by each goroutine in the pool.
-	// It continuously receives links from the jobs channel until
-	// the channel is closed.
 	worker := func() {
-		// Ensure the WaitGroup counter is decremented when
-		// this worker exits.
 		defer wg.Done()
-		for link := range jobs {
-			// IMPORTANT:
-			// We create a fresh timeout context *per link*.
-			//
-			// This avoids the bug where a single shared context
-			// times out and causes all remaining work to fail.
+
+		for meta := range jobs {
+			// Per-link timeout context. Critical for preventing cascading timeouts.
 			linkCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-
-			// Perform the actual HTTP check.
-			res := chk.Check(linkCtx, link)
-
-			// Always cancel to free timers/resources associated
-			// with the context.
+			res := chk.Check(linkCtx, meta.URL)
 			cancel()
 
-			// Send the result to the collector.
-			// This send will block only if the results buffer
-			// is full and the collector is not keeping up.
 			results <- res
 		}
 	}
 
-	// ---------------------------------------------------------------------
-	// Start worker goroutines
-	// ---------------------------------------------------------------------
-
-	// We start a fixed number of workers, equal to cfg.Concurrency.
-	// This caps parallelism and protects both the target site
-	// and our own machine.
 	wg.Add(cfg.Concurrency)
 	for i := 0; i < cfg.Concurrency; i++ {
 		go worker()
 	}
 
-	// ---------------------------------------------------------------------
-	// Feed jobs to the workers
-	// ---------------------------------------------------------------------
-
-	// This goroutine is responsible for sending all links
-	// into the jobs channel.
-	//
-	// When it finishes sending, it closes the channel to signal
-	// to workers that no more work is coming.
 	go func() {
-		for _, link := range links {
-			jobs <- link
+		for _, meta := range linksToCheck {
+			jobs <- meta
 		}
 		close(jobs)
 	}()
 
-	// ---------------------------------------------------------------------
-	// Close results channel when all workers are done
-	// ---------------------------------------------------------------------
-
-	// We cannot close results immediately, because workers
-	// may still be sending to it.
-	//
-	// Instead, we wait for all workers to finish, then close
-	// results so the collector can exit its loop cleanly.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// ---------------------------------------------------------------------
-	// Collect results
-	// ---------------------------------------------------------------------
+	checkProgress := newProgressLogger(cfg.ProgressEvery)
+	checked := 0
+	dead := 0
+	errors := 0
 
-	// The main goroutine acts as the collector.
-	// It ranges over results until the channel is closed.
-	all := make([]model.Result, 0, len(links))
+	// Collect results into slice so we can sort and print stably.
+	all := make([]model.Result, 0, len(linksToCheck))
 	for r := range results {
 		all = append(all, r)
+		checked++
+
+		if r.Err != nil {
+			errors++
+		} else if r.StatusCode >= 400 {
+			dead++
+		}
+
+		if checkProgress.ShouldLog() {
+			fmt.Fprintf(stdout,
+				"[check] checked=%d/%d dead=%d errors=%d\n",
+				checked,
+				len(linksToCheck),
+				dead,
+				errors,
+			)
+		}
 	}
+	sort.Slice(all, func(i, j int) bool { return all[i].URL < all[j].URL })
 
-	// Stable output: sort by URL before printing
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].URL < all[j].URL
-	})
-
-	// Print dead links and summary
+	// Summarize statuses.
 	s := summarize(all)
+	s.CrawledPages = crawledPages
+	s.Discovered = len(linkIndex)
+	s.Checked = len(linksToCheck)
+	s.SkippedExt = skippedExternal
+
+	// Print dead items with sources.
+	// (We print sources to satisfy Stage 3 requirement: link→source tracking.)
 	for _, r := range all {
-		// In Stage 1/2 we still print only "dead" items:
-		// - HTTP >= 400
-		// - any error (timeout/network/etc)
 		if r.IsDead() {
+			meta := linkIndex[r.URL]
+			srcList := sourcesAsSortedList(meta)
+
 			if r.Err != nil {
 				fmt.Fprintf(stdout, "DEAD  %-5s  %s\n", "ERR", r.URL)
 				fmt.Fprintf(stdout, "      %v\n", r.Err)
 			} else {
 				fmt.Fprintf(stdout, "DEAD  %-5d  %s\n", r.StatusCode, r.URL)
 			}
+
+			// Print where it was found.
+			if len(srcList) > 0 {
+				// Show first source + count (avoid huge spam, but still informative).
+				if len(srcList) == 1 {
+					fmt.Fprintf(stdout, "      found on: %s\n", srcList[0])
+				} else {
+					fmt.Fprintf(stdout, "      found on: %s (+%d more)\n", srcList[0], len(srcList)-1)
+				}
+			}
 		}
 	}
 
-	fmt.Fprintf(stdout, "\nChecked %d links. Dead: %d (HTTP: %d, Errors: %d). OK: %d. Redirects: %d\n",
-		s.Checked, (s.DeadHTTP + s.Errors), s.DeadHTTP, s.Errors, s.OK, s.Redirects,
+	fmt.Fprintf(stdout,
+		"\nCrawled pages: %d (max-pages=%d, max-depth=%d)\nDiscovered links: %d\nChecked links: %d\nSkipped external: %d (allow-external=%v)\nOK: %d  Redirects: %d  DeadHTTP: %d  Errors: %d\n",
+		s.CrawledPages, cfg.MaxPages, cfg.MaxDepth,
+		s.Discovered,
+		s.Checked,
+		s.SkippedExt, cfg.AllowExternal,
+		s.OK, s.Redirects, s.DeadHTTP, s.Errors,
 	)
 
-	_ = stderr // kept for future stages (logging, warnings)
-
-	// deadCount := 0
-	// for _, link := range links {
-	// 	// Each link check gets its own timeout budget (avoids “context deadline exceeded” cascade).
-	// 	linkCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	// 	res := chk.Check(linkCtx, link)
-	// 	cancel()
-	//
-	// 	if res.IsDead() {
-	// 		deadCount++
-	// 		if res.Err != nil {
-	// 			fmt.Fprintf(stdout, "DEAD  %-5s  %s\n", "ERR", res.URL)
-	// 			fmt.Fprintf(stdout, "      %v\n", res.Err)
-	// 		} else {
-	// 			fmt.Fprintf(stdout, "DEAD  %-5d  %s\n", res.StatusCode, res.URL)
-	// 		}
-	// 	}
-	// }
-	//
-	// fmt.Fprintf(stdout, "\nChecked %d links. Dead: %d\n", len(links), deadCount)
+	_ = stderr // reserved for later structured logging/warnings
 	return nil
+}
+
+// recordLink updates (or creates) linkMeta for a discovered link and tracks the source page.
+func recordLink(index map[string]*linkMeta, linkURL, sourcePage string, depth int) {
+	key := normalizeForKey(linkURL)
+
+	m, ok := index[key]
+	if !ok {
+		m = &linkMeta{
+			URL:            key,
+			FirstSeenDepth: depth,
+			Sources:        make(map[string]struct{}),
+		}
+		index[key] = m
+	}
+
+	// Keep earliest depth seen.
+	if depth < m.FirstSeenDepth {
+		m.FirstSeenDepth = depth
+	}
+
+	if sourcePage != "" {
+		m.Sources[normalizeForKey(sourcePage)] = struct{}{}
+	}
+}
+
+// normalizeForKey is a small normalization to improve deduping:
+// - strip fragment
+// - lowercase hostname
+// (More robust normalization will come later.)
+func normalizeForKey(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.Fragment = ""
+	if u.Host != "" {
+		// url.URL doesn't have Hostname setter, so normalize via Host field.
+		// Keep port if present.
+		host := strings.ToLower(u.Hostname())
+		if port := u.Port(); port != "" {
+			u.Host = host + ":" + port
+		} else {
+			u.Host = host
+		}
+	}
+	return u.String()
+}
+
+func sourcesAsSortedList(meta *linkMeta) []string {
+	if meta == nil || len(meta.Sources) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(meta.Sources))
+	for s := range meta.Sources {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func summarize(all []model.Result) summary {
 	var s summary
-	s.Checked = len(all)
 	for _, r := range all {
 		if r.Err != nil {
 			s.Errors++
@@ -239,9 +415,31 @@ func summarize(all []model.Result) summary {
 			s.Redirects++
 		case r.StatusCode >= 400:
 			s.DeadHTTP++
-		default:
-			// status code 0 etc shouldn't happen without error, but keep safe
 		}
 	}
 	return s
+}
+
+type progressLogger struct {
+	last  time.Time
+	every time.Duration
+}
+
+func newProgressLogger(every time.Duration) *progressLogger {
+	if every <= 0 {
+		every = time.Second
+	}
+	return &progressLogger{
+		last:  time.Now(),
+		every: every,
+	}
+}
+
+func (p *progressLogger) ShouldLog() bool {
+	now := time.Now()
+	if now.Sub(p.last) >= p.every {
+		p.last = now
+		return true
+	}
+	return false
 }
