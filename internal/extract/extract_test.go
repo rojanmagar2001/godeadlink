@@ -3,105 +3,79 @@ package extract
 import (
 	"strings"
 	"testing"
+
+	"github.com/rojanmagar2001/godeadlink/internal/model"
 )
 
-func TestExtractLinks_BasicResolution(t *testing.T) {
+func TestExtractLinks_ExtractsPagesAndAssets(t *testing.T) {
 	html := `
-	<html><body>
-		<a href="/a">A</a>
-		<a href="b">B</a>
-	</body></html>
-	`
+	<html><head>
+		<link href="/style.css" rel="stylesheet">
+	</head>
+	<body>
+		<a href="/page">page</a>
+		<img src="/img.png">
+		<script src="/app.js"></script>
+	</body></html>`
 
-	links, err := ExtractLinks("https://example.com/base/", strings.NewReader(html))
+	found, err := ExtractLinks("https://example.com/base/", strings.NewReader(html))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	want := map[string]bool{
-		"https://example.com/a":      true,
-		"https://example.com/base/b": true,
+	// Collect checkable URLs by kind
+	got := map[string]model.LinkKind{}
+	for _, f := range found {
+		if f.SkipReason == "" {
+			got[f.URL] = f.Kind
+		}
 	}
 
-	if len(links) != len(want) {
-		t.Fatalf("got %d links, want %d", len(links), len(want))
+	want := map[string]model.LinkKind{
+		"https://example.com/page":      model.LinkKindPage,
+		"https://example.com/style.css": model.LinkKindAsset,
+		"https://example.com/img.png":   model.LinkKindAsset,
+		"https://example.com/app.js":    model.LinkKindAsset,
 	}
 
-	for _, l := range links {
-		if !want[l] {
-			t.Fatalf("unexpected link: %s", l)
+	if len(got) != len(want) {
+		t.Fatalf("got %d, want %d: %#v", len(got), len(want), got)
+	}
+	for u, k := range want {
+		if got[u] != k {
+			t.Fatalf("expected %s kind %s, got %s", u, k, got[u])
 		}
 	}
 }
 
-func TestExtractLinks_SkipsUnsupportedSchemes(t *testing.T) {
+func TestExtractLinks_SkipsFragmentAndUnsupportedSchemes(t *testing.T) {
 	html := `
 	<html><body>
+		<a href="#section">frag</a>
 		<a href="mailto:test@example.com">mail</a>
 		<a href="tel:+123">tel</a>
 		<a href="javascript:void(0)">js</a>
 	</body></html>`
 
-	links, err := ExtractLinks("https://example.com", strings.NewReader(html))
+	found, err := ExtractLinks("https://example.com", strings.NewReader(html))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(links) != 0 {
-		t.Fatalf("expected 0 links, got %d: %#v", len(links), links)
-	}
-}
-
-func TestExtractLinks_DeduplicatesFragments(t *testing.T) {
-	html := `
-	<html><body>
-		<a href="/page#one">one</a>
-		<a href="/page#two">two</a>
-	</body></html>`
-
-	links, err := ExtractLinks("https://example.com", strings.NewReader(html))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(links) != 1 {
-		t.Fatalf("expected 1 link, got %d: %#v", len(links), links)
-	}
-
-	if links[0] != "https://example.com/page" {
-		t.Fatalf("unexpected link: %s", links[0])
-	}
-}
-
-func TestExtractLinks_ResolvesAndDedupes(t *testing.T) {
-	html := `
-	<html><body>
-		<a href="/ok">OK</a>
-		<a href="/ok#frag">OK2</a>
-		<a href="https://example.com/abs">ABS</a>
-		<a href="mailto:test@example.com">MAIL</a>
-		<a href="">EMPTY</a>
-	</body></html>`
-
-	links, err := ExtractLinks("http://localhost:1234/base", strings.NewReader(html))
-	if err != nil {
-		t.Fatalf("ExtractLinks error: %v", err)
-	}
-
-	// Expect:
-	// - http://localhost:1234/ok   (fragment dropped, deduped)
-	// - https://example.com/abs
-	want := map[string]bool{
-		"http://localhost:1234/ok": true,
-		"https://example.com/abs":  true,
-	}
-
-	if len(links) != len(want) {
-		t.Fatalf("got %d links, want %d: %#v", len(links), len(want), links)
-	}
-	for _, got := range links {
-		if !want[got] {
-			t.Fatalf("unexpected link: %s", got)
+	var frag, unsup int
+	for _, f := range found {
+		switch f.SkipReason {
+		case model.SkipFragmentOnly:
+			frag++
+		case model.SkipUnsupportedScheme:
+			unsup++
 		}
+	}
+
+	if frag != 1 {
+		t.Fatalf("expected 1 fragment skip, got %d", frag)
+	}
+	if unsup != 3 {
+		t.Fatalf("expected 3 unsupported scheme skips, got %d", unsup)
 	}
 }

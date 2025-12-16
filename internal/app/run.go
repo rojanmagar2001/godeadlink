@@ -153,7 +153,7 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		}
 
 		// Extract <a href> links from this page.
-		links, err := extract.ExtractLinks(job.URL, resp.Body)
+		found, err := extract.ExtractLinks(job.URL, resp.Body)
 		_ = resp.Body.Close()
 		cancel()
 		if err != nil {
@@ -165,9 +165,22 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		// Record the page itself as a link (useful to catch broken pages too).
 		recordLink(linkIndex, job.URL, job.URL, job.Depth)
 
-		for _, link := range links {
+		for _, fl := range found {
+			// If skipped, record as discovered (optional) but don’t crawl/check.
+			if fl.SkipReason != "" || fl.URL == "" {
+				// You can choose to record skipped links too, but it may be noisy.
+				// For learning, we record them as discovered with a marker in sources later (Stage 8).
+				continue
+			}
+			link := fl.URL
+
 			// Track source relationship: link was found on job.URL
 			recordLink(linkIndex, link, job.URL, job.Depth)
+
+			// Only crawl "page" links (anchors). Assets are checked but not crawled.
+			if fl.Kind != model.LinkKindPage {
+				continue
+			}
 
 			// Decide whether to enqueue this link as another page to crawl.
 			u, err := url.Parse(link)
