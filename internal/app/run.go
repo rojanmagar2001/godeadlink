@@ -68,30 +68,81 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		return fmt.Errorf("extract links: %w", err)
 	}
 
+	// ---------------------------------------------------------------------
+	// Worker pool setup
+	//
+	// We want to check many links concurrently without spawning an
+	// unbounded number of goroutines.
+	//
+	// Pattern used:
+	//   - jobs channel: carries links to be checked
+	//   - results channel: carries completed check results
+	//   - fixed number of worker goroutines
+	//   - WaitGroup to know when all workers are done
+	// ---------------------------------------------------------------------
 	chk := check.NewChecker(cfg.Timeout, cfg.HeadFirst)
 
-	// Worker pool: jobs -> Result
+	// jobs is an unbuffered channel of work items.
+	// Each item is a single link (string) to check.
 	jobs := make(chan string)
+
+	// results carries completed link-check results.
+	// We buffer it to the concurrency size so workers are not blocked
+	// on send if the collector is momentarily slow.
 	results := make(chan model.Result, cfg.Concurrency)
 
 	var wg sync.WaitGroup
+
+	// worker is the function run by each goroutine in the pool.
+	// It continuously receives links from the jobs channel until
+	// the channel is closed.
 	worker := func() {
+		// Ensure the WaitGroup counter is decremented when
+		// this worker exits.
 		defer wg.Done()
 		for link := range jobs {
-			// Each link check gets its own timeout budget
+			// IMPORTANT:
+			// We create a fresh timeout context *per link*.
+			//
+			// This avoids the bug where a single shared context
+			// times out and causes all remaining work to fail.
 			linkCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+
+			// Perform the actual HTTP check.
 			res := chk.Check(linkCtx, link)
+
+			// Always cancel to free timers/resources associated
+			// with the context.
 			cancel()
+
+			// Send the result to the collector.
+			// This send will block only if the results buffer
+			// is full and the collector is not keeping up.
 			results <- res
 		}
 	}
 
+	// ---------------------------------------------------------------------
+	// Start worker goroutines
+	// ---------------------------------------------------------------------
+
+	// We start a fixed number of workers, equal to cfg.Concurrency.
+	// This caps parallelism and protects both the target site
+	// and our own machine.
 	wg.Add(cfg.Concurrency)
 	for i := 0; i < cfg.Concurrency; i++ {
 		go worker()
 	}
 
-	// Feed jobs
+	// ---------------------------------------------------------------------
+	// Feed jobs to the workers
+	// ---------------------------------------------------------------------
+
+	// This goroutine is responsible for sending all links
+	// into the jobs channel.
+	//
+	// When it finishes sending, it closes the channel to signal
+	// to workers that no more work is coming.
 	go func() {
 		for _, link := range links {
 			jobs <- link
@@ -99,13 +150,26 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		close(jobs)
 	}()
 
-	// Close results when workers finish
+	// ---------------------------------------------------------------------
+	// Close results channel when all workers are done
+	// ---------------------------------------------------------------------
+
+	// We cannot close results immediately, because workers
+	// may still be sending to it.
+	//
+	// Instead, we wait for all workers to finish, then close
+	// results so the collector can exit its loop cleanly.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// Collect
+	// ---------------------------------------------------------------------
+	// Collect results
+	// ---------------------------------------------------------------------
+
+	// The main goroutine acts as the collector.
+	// It ranges over results until the channel is closed.
 	all := make([]model.Result, 0, len(links))
 	for r := range results {
 		all = append(all, r)
