@@ -29,6 +29,9 @@ type Config struct {
 
 	CheckAssets   bool
 	ProgressEvery time.Duration // e.g. 1s
+
+	Rate        int
+	PerHostRate int
 }
 
 // linkMeta tracks where a link was found + at what crawl depth it first appeared.
@@ -80,6 +83,12 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 	if !cfg.CheckAssets {
 		cfg.CheckAssets = true
 	}
+	if cfg.Rate <= 0 {
+		cfg.Rate = 10
+	}
+	if cfg.PerHostRate <= 0 {
+		cfg.PerHostRate = 2
+	}
 
 	crawlProgress := newProgressLogger(cfg.ProgressEvery)
 
@@ -88,6 +97,9 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		return fmt.Errorf("parse start url: %w", err)
 	}
 	startHost := strings.ToLower(start.Hostname())
+
+	globalLimiter := newTokenBucket(cfg.Rate)
+	hostLimiter := newHostLimiter(cfg.PerHostRate)
 
 	// ------------------------------------------------------------
 	// Stage 3: Crawl pages (same-host only) up to MaxDepth/MaxPages
@@ -127,6 +139,16 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		}
 		visitedPages[pageURL] = struct{}{}
 		crawledPages++
+
+		// Global rate limit
+		if err := globalLimiter.Take(ctx); err != nil {
+			return err
+		}
+
+		// Per-host rate limit
+		if err := hostLimiter.Take(ctx, job.URL); err != nil {
+			return err
+		}
 
 		// Fetch page with its own timeout context.
 		pageCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
@@ -268,6 +290,15 @@ func Run(ctx context.Context, cfg Config, stdout, stderr io.Writer) error {
 		defer wg.Done()
 
 		for meta := range jobs {
+			// Global rate limit
+			if err := globalLimiter.Take(ctx); err != nil {
+				return
+			}
+
+			// Per-host rate limit
+			if err := hostLimiter.Take(ctx, meta.URL); err != nil {
+				return
+			}
 			// Per-link timeout context. Critical for preventing cascading timeouts.
 			linkCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 			res := chk.Check(linkCtx, meta.URL)

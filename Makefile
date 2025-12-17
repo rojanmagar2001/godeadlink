@@ -18,6 +18,8 @@ CONCURRENCY ?= 20
 MAX_DEPTH ?= 2
 MAX_PAGES ?= 200
 ALLOW_EXTERNAL ?= false
+RATE ?= 10
+PER_HOST_RATE ?= 2
 
 # =========================
 # Phony targets
@@ -73,7 +75,9 @@ run:
 		--concurrency=$(CONCURRENCY) \
 		--max-depth=$(MAX_DEPTH) \
 		--max-pages=$(MAX_PAGES) \
-		--allow-external=$(ALLOW_EXTERNAL)	
+		--allow-external=$(ALLOW_EXTERNAL) \
+		--rate=$(RATE) \
+		--per-host-rate=$(PER_HOST_RATE)
 
 dev: fmt test run
 

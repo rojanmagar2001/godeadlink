@@ -20,6 +20,8 @@ func main() {
 		maxPages      = flag.Int("max-pages", 200, "Max number of pages to crawl")
 		allowExternal = flag.Bool("allow-external", false, "Also check external links (default: false)")
 		checkAssets   = flag.Bool("check-assets", true, "Check asset links (img, script, link)")
+		rate          = flag.Int("rate", 10, "Global request rate (req/sec)")
+		perHost       = flag.Int("per-host-rate", 2, "Per-host request rate (req/sec)")
 	)
 	flag.Parse()
 
@@ -32,6 +34,8 @@ func main() {
 		MaxPages:      *maxPages,
 		AllowExternal: *allowExternal,
 		CheckAssets:   *checkAssets,
+		Rate:          *rate,
+		PerHostRate:   *perHost,
 	}
 
 	if err := app.Run(context.Background(), cfg, os.Stdout, os.Stderr); err != nil {
