@@ -1,10 +1,12 @@
-package app
+package limiter
 
 import (
 	"context"
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/rojanmagar2001/godeadlink/internal/ports"
 )
 
 // tokenBucket is a simple rate limiter using a buffered channel.
@@ -46,20 +48,29 @@ func (t *tokenBucket) Take(ctx context.Context) error {
 }
 
 // hostLimiter manages per-host buckets
-type hostLimiter struct {
-	mu    sync.Mutex
-	rate  int
-	hosts map[string]*tokenBucket
+type PerHost struct {
+	global *tokenBucket
+
+	mu   sync.Mutex
+	rate int
+	host map[string]*tokenBucket
 }
 
-func newHostLimiter(rate int) *hostLimiter {
-	return &hostLimiter{
-		rate:  rate,
-		hosts: make(map[string]*tokenBucket),
+func New(globalRate, perHostRate int) ports.Limiter {
+	if globalRate <= 0 {
+		globalRate = 10
+	}
+	if perHostRate <= 0 {
+		perHostRate = 2
+	}
+	return &PerHost{
+		global: newTokenBucket(globalRate),
+		rate:   perHostRate,
+		host:   make(map[string]*tokenBucket),
 	}
 }
 
-func (h *hostLimiter) Take(ctx context.Context, rawURL string) error {
+func (h *PerHost) Take(ctx context.Context, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil // invalid URL already handled elsewhere
@@ -70,10 +81,10 @@ func (h *hostLimiter) Take(ctx context.Context, rawURL string) error {
 	}
 
 	h.mu.Lock()
-	tb, ok := h.hosts[host]
+	tb, ok := h.host[host]
 	if !ok {
 		tb = newTokenBucket(h.rate)
-		h.hosts[host] = tb
+		h.host[host] = tb
 	}
 	h.mu.Unlock()
 

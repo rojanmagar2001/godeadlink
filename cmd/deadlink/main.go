@@ -22,8 +22,12 @@ func main() {
 		checkAssets   = flag.Bool("check-assets", true, "Check asset links (img, script, link)")
 		rate          = flag.Int("rate", 10, "Global request rate (req/sec)")
 		perHost       = flag.Int("per-host-rate", 2, "Per-host request rate (req/sec)")
+		maxRuntime    = flag.Duration("max-runtime", 2*time.Minute, "Overall max runtime")
 	)
 	flag.Parse()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *maxRuntime)
+	defer cancel()
 
 	cfg := app.Config{
 		StartURL:      *startURL,
@@ -38,7 +42,7 @@ func main() {
 		PerHostRate:   *perHost,
 	}
 
-	if err := app.Run(context.Background(), cfg, os.Stdout, os.Stderr); err != nil {
+	if err := app.Run(ctx, cfg, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
